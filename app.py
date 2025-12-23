@@ -144,16 +144,16 @@ def main():
 
             extracted = handler.extract(parsed)
             # ---- DEBUG MODE (temporary) ----
-debug = st.checkbox("Debug mode (show what was extracted)", value=True)
+            debug = st.checkbox("Debug mode (show what was extracted)", value=True)
 
-if debug:
-    st.subheader("DEBUG: Extracted fields")
-    st.json(extracted)
+            if debug:
+            st.subheader("DEBUG: Extracted fields")
+            st.json(extracted)
 
-    schedule = extracted.get("schedule", []) or extracted.get("benefit_schedule", []) or []
-    st.subheader(f"DEBUG: Schedule rows found = {len(schedule)}")
+            schedule = extracted.get("schedule", []) or extracted.get("benefit_schedule", []) or []
+            st.subheader(f"DEBUG: Schedule rows found = {len(schedule)}")
 
-    if schedule:
+            if schedule:
         st.dataframe(schedule[:20])  # show first 20 rows
     else:
         st.warning("No schedule table rows were extracted from the PDF.")
