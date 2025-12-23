@@ -1,5 +1,4 @@
 from core.models import ParsedPDF
-
 def read_pdf(file_bytes: bytes) -> ParsedPDF:
     text_by_page: List[str] = []
     tables_by_page: List[List[List[List[Optional[str]]]]] = []
