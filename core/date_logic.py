@@ -28,12 +28,21 @@ def _subtract_months(d: date, months: int) -> date:
     day = min(d.day, _days_in_month(y, m))
     return date(y, m, day)
 
-def _impl_derive_rcd_and_rpu(bi_date: date, ptd: date, mode: str):
+def derive_rcd_and_rpu_dates(bi_date: date, ptd: date, mode: str):
+    """
+    RCD rule (per your instruction):
+      - RCD is the smallest date in the {PTD, PTD-interval, PTD-2*interval, ...}
+        such that RCD >= BI date.
+    RPU effective date:
+      - PTD + grace period
+    Grace period:
+      - monthly: 15 days
+      - all other modes: 30 days
+    """
     mode = (mode or "Annual").strip()
     months = MODE_MONTHS.get(mode, MODE_MONTHS.get(mode.title(), 12))
     grace_days = 15 if mode.lower() == "monthly" else 30
 
-    # Find RCD such that RCD >= BI date, stepping backwards from PTD by mode months
     candidate = ptd
     while True:
         prev = _subtract_months(candidate, months)
@@ -44,11 +53,3 @@ def _impl_derive_rcd_and_rpu(bi_date: date, ptd: date, mode: str):
 
     rpu_date = ptd + timedelta(days=grace_days)
     return rcd, rpu_date, grace_days
-
-# --- Public API name 1 (what your latest gis.py is trying to import) ---
-def derive_rcd_and_rpu_dates(bi_date: date, ptd: date, mode: str):
-    return _impl_derive_rcd_and_rpu(bi_date, ptd, mode)
-
-# --- Public API name 2 (what some earlier versions used) ---
-def derive_rcd_and_rpu_dates(bi_date: date, ptd: date, mode: str):
-    return _impl_derive_rcd_and_rpu(bi_date, ptd, mode)
