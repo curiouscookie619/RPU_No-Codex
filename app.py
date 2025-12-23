@@ -120,9 +120,13 @@ def main():
     device = st.selectbox("Device", ["Desktop", "Mobile", "Tablet"], index=0)
     st.session_state["device"] = device
 
+    # Put debug toggle outside the button so you can keep it on/off across runs
+    debug = st.checkbox("Debug mode (show what was extracted)", value=True)
+
     uploaded = st.file_uploader("Upload BI PDF", type=["pdf"])
     ptd = st.date_input("PTD (Next Premium Due Date)", value=None)
 
+    file_hash = None
     if uploaded is not None:
         file_bytes = uploaded.getvalue()
         file_hash = _sha256_bytes(file_bytes)
@@ -136,29 +140,35 @@ def main():
         try:
             file_bytes = uploaded.getvalue()
             parsed = read_pdf(file_bytes)
-
             log_event("pdf_parsed", session_id, {"pages": parsed.page_count}, case_id=None)
 
             handler, conf, dbg = detect_product(parsed)
             log_event("product_detected", session_id, {"product_id": handler.product_id, "confidence": conf, "dbg": dbg})
 
             extracted = handler.extract(parsed)
-            # ---- DEBUG MODE (temporary) ----
-            debug = st.checkbox("Debug mode (show what was extracted)", value=True)
 
+            # ----- DEBUG (safe display) -----
             if debug:
-            st.subheader("DEBUG: Extracted fields")
-            st.json(extracted)
+                st.subheader("DEBUG: Extracted object (raw)")
+                try:
+                    extracted_dump = extracted.model_dump()
+                except Exception:
+                    # fallback if extracted isn't pydantic for some reason
+                    extracted_dump = dict(extracted) if isinstance(extracted, dict) else {"repr": repr(extracted)}
+                st.json(extracted_dump)
 
-            schedule = extracted.get("schedule", []) or extracted.get("benefit_schedule", []) or []
-            st.subheader(f"DEBUG: Schedule rows found = {len(schedule)}")
+                st.subheader("DEBUG: Schedule preview")
+                schedule_rows = getattr(extracted, "schedule_rows", None)
+                if schedule_rows is None:
+                    schedule_rows = extracted_dump.get("schedule_rows") or extracted_dump.get("schedule") or []
+                st.write(f"Schedule rows found = {len(schedule_rows)}")
+                if schedule_rows:
+                    st.dataframe(schedule_rows[:25])
+                else:
+                    st.warning("No schedule rows were extracted. Table detection/parsing is failing for this PDF.")
+            # ----- END DEBUG -----
 
-            if schedule:
-        st.dataframe(schedule[:20])  # show first 20 rows
-    else:
-        st.warning("No schedule table rows were extracted from the PDF.")
-# ---- END DEBUG MODE ----
-log_event(
+            log_event(
                 "fields_extracted",
                 session_id,
                 {
@@ -178,7 +188,6 @@ log_event(
                 {"rcd": outputs.rcd, "rpu_date": outputs.rpu_date, "rpu_factor": outputs.rpu_factor},
             )
 
-            # case id (hash only)
             case_id = _make_case_id(
                 product_id=handler.product_id,
                 product_uin=extracted.product_uin,
@@ -192,9 +201,8 @@ log_event(
                 proposer_name_transient=extracted.proposer_name_transient,
             )
 
-            # Prepare JSON for DB (strip transient name)
             extracted_json = extracted.model_dump()
-            extracted_json["proposer_name_transient"] = None
+            extracted_json["proposer_name_transient"] = None  # transient only
 
             outputs_json = outputs.model_dump()
 
@@ -208,7 +216,7 @@ log_event(
                 rcd=outputs.rcd,
                 rpu_date=outputs.rpu_date,
                 mode=extracted.mode,
-                file_hash=file_hash,
+                file_hash=file_hash or "",
                 extracted_json=extracted_json,
                 outputs_json=outputs_json,
             )
