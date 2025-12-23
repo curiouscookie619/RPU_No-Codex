@@ -18,7 +18,13 @@ def _sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def _make_case_id(
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=128)
+def _cached_read_pdf(file_bytes: bytes):
+    # cache by content (Streamlit cache uses argument hashing)
+    return read_pdf(file_bytes)
+
+
+def make_case_id(
     product_id: str,
     product_uin: Optional[str],
     bi_date: date,
@@ -30,7 +36,6 @@ def _make_case_id(
     annualized_premium: Optional[float],
     proposer_name_transient: Optional[str],
 ) -> str:
-    # Proposer name can be included as entropy but is not persisted; only the hash is stored.
     raw = "|".join(
         [
             product_id,
@@ -69,10 +74,18 @@ def save_case(
                              mode, file_hash, extracted, outputs)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
             ON CONFLICT (case_id) DO UPDATE SET
-              session_id=EXCLUDED.session_id,
-              product_confidence=EXCLUDED.product_confidence,
-              extracted=EXCLUDED.extracted,
-              outputs=EXCLUDED.outputs
+                session_id=EXCLUDED.session_id,
+                product_id=EXCLUDED.product_id,
+                product_confidence=EXCLUDED.product_confidence,
+                bi_date=EXCLUDED.bi_date,
+                ptd=EXCLUDED.ptd,
+                rcd=EXCLUDED.rcd,
+                rpu_date=EXCLUDED.rpu_date,
+                mode=EXCLUDED.mode,
+                file_hash=EXCLUDED.file_hash,
+                extracted=EXCLUDED.extracted,
+                outputs=EXCLUDED.outputs,
+                updated_at=NOW()
             """,
             (
                 case_id,
@@ -85,214 +98,214 @@ def save_case(
                 rpu_date,
                 mode,
                 file_hash,
-                json.dumps(extracted_json, default=str),
-                json.dumps(outputs_json, default=str),
+                json.dumps(extracted_json),
+                json.dumps(outputs_json),
             ),
         )
         conn.commit()
 
 
-def save_feedback(session_id: str, case_id: str, rating: Optional[int], comment: Optional[str]) -> None:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO feedback(session_id, case_id, rating, comment)
-            VALUES (%s,%s,%s,%s)
-            """,
-            (session_id, case_id, rating, comment),
-        )
-        conn.commit()
+def _fmt_money(v: Any) -> str:
+    if v is None:
+        return "-"
+    try:
+        return f"{float(v):,.0f}"
+    except Exception:
+        return str(v)
+
+
+def _render_income_segments_bullets(segments: list[dict], title: str):
+    st.markdown(f"**{title}**")
+    if not segments:
+        st.write("- (No income rows detected)")
+        return
+
+    for seg in segments:
+        inc = seg.get("income")
+        yrs = seg.get("years")
+        s = seg.get("start_year")
+        e = seg.get("end_year")
+        st.write(f"- ₹{_fmt_money(inc)} per year for **{yrs}** years (Policy Year {s}–{e})")
 
 
 def main():
-    st.set_page_config(page_title="RPU Calculator (Internal)", layout="centered")
+    st.set_page_config(page_title="RPU Calculator", layout="centered")
+
     init_db()
 
     if "session_id" not in st.session_state:
-        st.session_state["session_id"] = hashlib.sha256(st.session_state.__repr__().encode("utf-8")).hexdigest()[:16]
-        log_event("session_start", st.session_state["session_id"], {"app": "rpu_streamlit", "version": "m1"})
+        st.session_state["session_id"] = hashlib.sha256(str(st.session_state).encode("utf-8")).hexdigest()
+        log_event("session_start", st.session_state["session_id"], {"version": "m1"})
 
     session_id = st.session_state["session_id"]
 
     st.title("Reduced Paid-Up Calculator (Internal)")
     st.caption("Upload a Benefit Illustration PDF and enter PTD (Next Premium Due Date). No PDFs are stored.")
 
-    device = st.selectbox("Device", ["Desktop", "Mobile", "Tablet"], index=0)
-    st.session_state["device"] = device
+    # Use a form to avoid rerun/button non-responsiveness
+    with st.form("main_form"):
+        debug = st.checkbox("Debug mode (show what was extracted)", value=True)
+        uploaded = st.file_uploader("Upload BI PDF", type=["pdf"])
+        ptd = st.date_input("PTD (Next Premium Due Date)", value=None, format="DD/MM/YYYY")
+        submitted = st.form_submit_button("Generate")
 
-    # Put debug toggle outside the button so you can keep it on/off across runs
-    debug = st.checkbox("Debug mode (show what was extracted)", value=True)
+    if not submitted:
+        return
 
-    uploaded = st.file_uploader("Upload BI PDF", type=["pdf"])
-    ptd = st.date_input("PTD (Next Premium Due Date)", value=None)
+    if uploaded is None or ptd is None:
+        st.error("Please upload a PDF and enter PTD.")
+        return
 
-    file_hash = None
-    if uploaded is not None:
-        file_bytes = uploaded.getvalue()
-        file_hash = _sha256_bytes(file_bytes)
-        log_event(
-            "pdf_uploaded",
-            session_id,
-            {"file_size_kb": round(len(file_bytes) / 1024, 2), "file_hash": file_hash, "device": device},
+    file_bytes = uploaded.getvalue()
+    file_hash = _sha256_bytes(file_bytes)
+
+    log_event("pdf_uploaded", session_id, {"file_hash": file_hash, "size_bytes": len(file_bytes)})
+
+    try:
+        # Cached parsing for speed (especially repeated attempts)
+        parsed = _cached_read_pdf(file_bytes)
+        log_event("pdf_parsed", session_id, {"pages": parsed.page_count})
+
+        handler, conf, dbg = detect_product(parsed)
+        log_event("product_detected", session_id, {"product_id": handler.product_id, "confidence": conf, "dbg": dbg})
+
+        extracted = handler.extract(parsed)
+        outputs = handler.calculate(extracted, ptd)
+
+        extracted_dump = extracted.model_dump()
+        outputs_dump = outputs.model_dump()
+
+        # Build case_id (we store only hashes, not proposer name)
+        case_id = make_case_id(
+            product_id=handler.product_id,
+            product_uin=extracted.product_uin,
+            bi_date=extracted.bi_generation_date,
+            ptd=ptd,
+            rcd=outputs.rcd,
+            mode=extracted.mode,
+            pt=extracted.policy_term_years,
+            ppt=extracted.ppt_years,
+            annualized_premium=extracted.annualized_premium_excl_tax,
+            proposer_name_transient=extracted.proposer_name_transient,
         )
 
-    if st.button("Generate", type="primary", disabled=(uploaded is None or ptd is None)):
-        try:
-            file_bytes = uploaded.getvalue()
-            parsed = read_pdf(file_bytes)
-            log_event("pdf_parsed", session_id, {"pages": parsed.page_count}, case_id=None)
+        save_case(
+            case_id=case_id,
+            session_id=session_id,
+            product_id=handler.product_id,
+            product_confidence=conf,
+            bi_date=extracted.bi_generation_date,
+            ptd=ptd,
+            rcd=outputs.rcd,
+            rpu_date=outputs.rpu_date,
+            mode=extracted.mode,
+            file_hash=file_hash,
+            extracted_json=extracted_dump,
+            outputs_json=outputs_dump,
+        )
 
-            handler, conf, dbg = detect_product(parsed)
-            log_event("product_detected", session_id, {"product_id": handler.product_id, "confidence": conf, "dbg": dbg})
+        log_event("output_generated", session_id, {"case_id": case_id, "product_id": handler.product_id})
 
-            extracted = handler.extract(parsed)
+        # ---------- DEBUG ----------
+        if debug:
+            st.subheader("DEBUG: Extracted object (raw)")
+            st.json(extracted_dump)
 
-            # ----- DEBUG (safe display) -----
-            if debug:
-                st.subheader("DEBUG: Extracted object (raw)")
-                try:
-                    extracted_dump = extracted.model_dump()
-                except Exception:
-                    # fallback if extracted isn't pydantic for some reason
-                    extracted_dump = dict(extracted) if isinstance(extracted, dict) else {"repr": repr(extracted)}
-                st.json(extracted_dump)
+            st.subheader("DEBUG: Schedule preview")
+            schedule_rows = extracted_dump.get("schedule_rows") or []
+            st.write(f"Schedule rows found = {len(schedule_rows)}")
+            if schedule_rows:
+                st.dataframe(schedule_rows[:20], use_container_width=True)
 
-                st.subheader("DEBUG: Schedule preview")
-                schedule_rows = getattr(extracted, "schedule_rows", None)
-                if schedule_rows is None:
-                    schedule_rows = extracted_dump.get("schedule_rows") or extracted_dump.get("schedule") or []
-                st.write(f"Schedule rows found = {len(schedule_rows)}")
-                if schedule_rows:
-                    st.dataframe(schedule_rows[:25])
-                else:
-                    st.warning("No schedule rows were extracted. Table detection/parsing is failing for this PDF.")
-            # ----- END DEBUG -----
+        # ---------- OUTPUT SUMMARY ----------
+        st.divider()
+        st.subheader("Key Dates Summary")
+        st.json(
+            {
+                "BI (Quote) Date": str(extracted.bi_generation_date),
+                "RCD (Derived)": str(outputs.rcd),
+                "PTD (Input)": str(ptd),
+                "Assumed RPU Date (PTD + Grace)": str(outputs.rpu_date),
+                "Grace Period Days": outputs.grace_period_days,
+            }
+        )
 
-            log_event(
-                "fields_extracted",
-                session_id,
-                {
-                    "product_name": extracted.product_name,
-                    "uin": extracted.product_uin,
-                    "mode": extracted.mode,
-                    "pt": extracted.policy_term_years,
-                    "ppt": extracted.ppt_years,
-                    "schedule_rows": len(extracted.schedule_rows),
-                },
-            )
+        st.divider()
+        st.subheader("Fully Paid vs Reduced Paid-Up (Summary)")
 
-            outputs = handler.calculate(extracted, ptd)
-            log_event(
-                "calculation_success",
-                session_id,
-                {"rcd": outputs.rcd, "rpu_date": outputs.rpu_date, "rpu_factor": outputs.rpu_factor},
-            )
+        fully = outputs.fully_paid or {}
+        rpu = outputs.reduced_paid_up or {}
 
-            case_id = _make_case_id(
-                product_id=handler.product_id,
-                product_uin=extracted.product_uin,
-                bi_date=extracted.bi_generation_date,
-                ptd=ptd,
-                rcd=outputs.rcd,
-                mode=extracted.mode,
-                pt=extracted.policy_term_years,
-                ppt=extracted.ppt_years,
-                annualized_premium=extracted.annualized_premium_excl_tax,
-                proposer_name_transient=extracted.proposer_name_transient,
-            )
+        # Premium
+        st.markdown("**Premium (from BI Premium Summary)**")
+        st.write(f"- Instalment Premium without GST: ₹{_fmt_money(fully.get('instalment_premium_without_gst'))}")
 
-            extracted_json = extracted.model_dump()
-            extracted_json["proposer_name_transient"] = None  # transient only
+        st.divider()
 
-            outputs_json = outputs.model_dump()
+        # Fully Paid (stacked - responsive)
+        st.markdown("### Fully Paid (as per BI)")
+        _render_income_segments_bullets(fully.get("income_segments") or [], "Income pay-outs")
+        st.write(f"- Total Income (sum): ₹{_fmt_money(fully.get('total_income'))}")
+        st.write(f"- Maturity / Lump Sum: ₹{_fmt_money(fully.get('maturity'))}")
+        st.write(f"- Death Benefit (schedule last year): ₹{_fmt_money(fully.get('death_last_year') or fully.get('death_inception'))}")
 
-            save_case(
-                case_id=case_id,
-                session_id=session_id,
-                product_id=handler.product_id,
-                product_confidence=conf,
-                bi_date=extracted.bi_generation_date,
-                ptd=ptd,
-                rcd=outputs.rcd,
-                rpu_date=outputs.rpu_date,
-                mode=extracted.mode,
-                file_hash=file_hash or "",
-                extracted_json=extracted_json,
-                outputs_json=outputs_json,
-            )
+        st.divider()
 
-            st.success("Generated successfully.")
-            st.subheader("Detected Product")
-            st.write(f"{extracted.product_name} ({handler.product_id})")
+        st.markdown("### Reduced Paid-Up (Assuming non-payment after PTD + grace)")
+        st.write(f"- RPU factor: **{rpu.get('rpu_factor')}**")
+        segs_scaled = rpu.get("income_segments_scaled") or []
+        st.markdown("**Income pay-outs (scaled)**")
+        if not segs_scaled:
+            st.write("- (No income rows detected)")
+        else:
+            for seg in segs_scaled:
+                inc = seg.get("income")
+                inc_scaled = seg.get("income_scaled")
+                yrs = seg.get("years")
+                s = seg.get("start_year")
+                e = seg.get("end_year")
+                st.write(f"- ₹{_fmt_money(inc_scaled)} per year for **{yrs}** years (Policy Year {s}–{e}) [orig: ₹{_fmt_money(inc)}]")
 
-            st.subheader("Key Dates")
-            st.write(
-                {
-                    "BI (Quote) Date": extracted.bi_generation_date,
-                    "RCD (Derived)": outputs.rcd,
-                    "PTD (Input)": outputs.ptd,
-                    "Assumed RPU Date (PTD + Grace)": outputs.rpu_date,
-                    "Grace Period Days": outputs.grace_period_days,
-                }
-            )
+        st.write(f"- Total Income (scaled): ₹{_fmt_money(rpu.get('total_income'))}")
+        st.write(f"- Maturity (scaled): ₹{_fmt_money(rpu.get('maturity'))}")
+        st.write(f"- Death Benefit (scaled): ₹{_fmt_money(rpu.get('death_scaled'))}")
 
-            st.subheader("Fully Paid vs Reduced Paid-Up (Summary)")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Fully Paid**")
-                st.write(outputs.fully_paid)
-            with col2:
-                st.markdown("**Reduced Paid-Up**")
-                st.write(outputs.reduced_paid_up)
+        # Notes
+        if outputs.notes:
+            st.divider()
+            st.subheader("Notes")
+            for n in outputs.notes:
+                st.write(f"- {n}")
 
-            st.subheader("Download Output PDF")
-            customer_name = extracted.proposer_name_transient or "Customer"
-            summary = {
+        # ---------- PDF download ----------
+        st.divider()
+        st.subheader("Download one-pager (neutral)")
+        pdf_bytes = render_one_pager(
+            customer_name=(extracted.proposer_name_transient or "Customer"),
+            product_name=extracted.product_name,
+            summary={
                 "Mode": extracted.mode,
                 "PT": extracted.policy_term_years,
                 "PPT": extracted.ppt_years,
-                "BI Date": extracted.bi_generation_date,
-                "RCD": outputs.rcd,
-                "PTD": outputs.ptd,
-                "Assumed RPU Date (PTD + Grace)": outputs.rpu_date,
-            }
-            pdf_bytes = render_one_pager(
-                customer_name=customer_name,
-                product_name=extracted.product_name,
-                summary=summary,
-                fully_paid={
-                    "total_income": outputs.fully_paid.get("total_income_annual"),
-                    "maturity": outputs.fully_paid.get("maturity"),
-                    "death_inception": outputs.fully_paid.get("death_inception"),
-                },
-                rpu={
-                    "rpu_factor": outputs.reduced_paid_up.get("rpu_factor"),
-                    "total_income": outputs.reduced_paid_up.get("total_income"),
-                    "maturity": outputs.reduced_paid_up.get("maturity"),
-                    "death_scaled": outputs.reduced_paid_up.get("death_scaled"),
-                },
-                notes=outputs.notes,
-            )
-            log_event("output_pdf_generated", session_id, {"bytes": len(pdf_bytes)}, case_id=case_id)
+                "BI Date": str(extracted.bi_generation_date),
+                "RCD": str(outputs.rcd),
+                "PTD": str(ptd),
+                "Assumed RPU Date (PTD + Grace)": str(outputs.rpu_date),
+            },
+            fully_paid=fully,
+            rpu=rpu,
+            notes=outputs.notes or [],
+        )
+        st.download_button(
+            "Download PDF",
+            data=pdf_bytes,
+            file_name=f"rpu_summary_{handler.product_id}.pdf",
+            mime="application/pdf",
+        )
 
-            st.download_button(
-                "Download PDF",
-                data=pdf_bytes,
-                file_name=f"RPU_Output_{case_id[:8]}.pdf",
-                mime="application/pdf",
-            )
-
-            st.subheader("Feedback (Optional)")
-            rating = st.select_slider("Rating", options=[1, 2, 3, 4, 5], value=4)
-            comment = st.text_area("Comment", placeholder="Optional feedback…")
-            if st.button("Submit Feedback"):
-                save_feedback(session_id=session_id, case_id=case_id, rating=rating, comment=comment)
-                log_event("feedback_submitted", session_id, {"rating": rating, "has_comment": bool(comment)}, case_id=case_id)
-                st.success("Feedback submitted.")
-
-        except Exception as e:
-            log_event("calculation_failed", session_id, {"error": str(e)}, case_id=None)
-            st.error(f"Failed: {e}")
+    except Exception as e:
+        st.error(f"Failed: {e}")
+        log_event("error", session_id, {"error": str(e)})
 
 
 if __name__ == "__main__":
