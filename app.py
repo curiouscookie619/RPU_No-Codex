@@ -143,7 +143,22 @@ def main():
             log_event("product_detected", session_id, {"product_id": handler.product_id, "confidence": conf, "dbg": dbg})
 
             extracted = handler.extract(parsed)
-            log_event(
+            # ---- DEBUG MODE (temporary) ----
+debug = st.checkbox("Debug mode (show what was extracted)", value=True)
+
+if debug:
+    st.subheader("DEBUG: Extracted fields")
+    st.json(extracted)
+
+    schedule = extracted.get("schedule", []) or extracted.get("benefit_schedule", []) or []
+    st.subheader(f"DEBUG: Schedule rows found = {len(schedule)}")
+
+    if schedule:
+        st.dataframe(schedule[:20])  # show first 20 rows
+    else:
+        st.warning("No schedule table rows were extracted from the PDF.")
+# ---- END DEBUG MODE ----
+log_event(
                 "fields_extracted",
                 session_id,
                 {
