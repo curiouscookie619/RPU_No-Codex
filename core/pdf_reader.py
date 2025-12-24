@@ -31,6 +31,7 @@ def read_pdf(file_bytes: bytes) -> ParsedPDF:
 
     from io import BytesIO
 
+    
     def _looks_like_schedule_page(page_text: str) -> bool:
         """Heuristic: continuation schedule pages may not repeat 'Policy Year' header.
         Detect pages that look like they contain schedule rows as plain text, e.g.:
@@ -49,7 +50,7 @@ def read_pdf(file_bytes: bytes) -> ParsedPDF:
                 return True
         return False
 
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         # First pass: extract text for all pages
         for p in pdf.pages:
             text_by_page.append(p.extract_text() or "")
@@ -85,7 +86,6 @@ def read_pdf(file_bytes: bytes) -> ParsedPDF:
 
             if has_policy_year or looks_like_schedule:
                 schedule_started = True
-
     # Fallback: if almost no text, try pypdf extraction
     if sum(len(t.strip()) for t in text_by_page) < 50:
         reader = PdfReader(BytesIO(file_bytes))

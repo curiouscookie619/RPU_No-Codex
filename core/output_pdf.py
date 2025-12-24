@@ -60,7 +60,7 @@ def render_one_pager(
 
     # Income table (calendar year wise)
     income_items_full = fully_paid.get("income_items") or []
-    income_items_rpu = rpu.get("income_items_remaining_full") or []
+    income_items_rpu = rpu.get("income_items") or []
     rpu_by_year = {int(i.get("calendar_year")): i.get("amount") for i in income_items_rpu if i.get("calendar_year") is not None}
 
     c.setFont("Helvetica-Bold", 10)

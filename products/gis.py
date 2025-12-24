@@ -222,29 +222,6 @@ def _last_non_null(schedule_rows: List[Dict[str, Any]], key: str) -> Optional[fl
 # Handler
 # -------------------------
 
-
-def _safe_anniversary(d: date, years_to_add: int) -> date:
-    """
-    Return d shifted by `years_to_add` years, keeping month/day when possible.
-    Handles Feb 29th by clamping to Feb 28th on non-leap years.
-    """
-    y = d.year + int(years_to_add)
-    m = d.month
-    day = d.day
-    try:
-        return date(y, m, day)
-    except ValueError:
-        # clamp Feb 29 -> Feb 28
-        if m == 2 and day == 29:
-            return date(y, 2, 28)
-        # generic clamp to last valid day of month
-        for dd in (31, 30, 29, 28):
-            try:
-                return date(y, m, dd)
-            except ValueError:
-                continue
-        return date(y, m, 28)
-
 class GISHandler(ProductHandler):
     product_id = "GIS"
 
@@ -417,7 +394,7 @@ class GISHandler(ProductHandler):
 
         # ---- Premium months (Pp, Pt) ----
         # months between RCD and RPU date (RPU date = PTD + grace)
-        months_paid = max(0, (rpu_date.year - rcd.year) * 12 + (rpu_date.month - rcd.month))
+        months_paid = max(0, (ptd.year - rcd.year) * 12 + (ptd.month - rcd.month))
         months_payable_total = int(extracted.ppt_years) * 12 if extracted.ppt_years else 0
 
         R = (months_paid / months_payable_total) if months_payable_total > 0 else 0.0
@@ -478,6 +455,23 @@ class GISHandler(ProductHandler):
             "death_last_year": float(last_death) if last_death is not None else None,
         }
 
+        remaining_events = [e for e in income_events if e["payout_date"] >= rpu_date]
+        excess_paid = Ia * (1.0 - R)
+        deduction_per_remaining = (excess_paid / len(remaining_events)) if remaining_events else 0.0
+
+        income_items_rpu: List[Dict[str, Any]] = []
+        for e in remaining_events:
+            scaled = float(e["amount"]) * R
+            adj = max(0.0, scaled - deduction_per_remaining)
+            income_items_rpu.append(
+                {
+                    "policy_year": e["policy_year"],
+                    "calendar_year": e["calendar_year"],
+                    "payout_date": e["payout_date"],
+                    "amount": round(adj, 2),
+                }
+            )
+
         reduced_paid_up = {
             "rpu_factor": round(R, 6),
             "income_total_full": float(It),
@@ -485,9 +479,9 @@ class GISHandler(ProductHandler):
             "income_due_full": float(income_due_full),
             "income_payable_after_rpu": float(rpu_income_total),
             "income_segments": segments,
-            # For table/PDF: show remaining years (>= RPU date) with full-pay amounts,
-            # and show a single net payable figure separately (since SL formula nets out).
-            "income_items_remaining_full": [e for e in income_events if e["payout_date"] >= rpu_date],
+            "income_items": income_items_rpu,
+            "excess_paid_income": float(excess_paid),
+            "deduction_per_remaining": float(deduction_per_remaining),
             "maturity": (float(maturity) * R) if maturity is not None else None,
             "death_scaled": (float(last_death) * R) if last_death is not None else None,
         }
