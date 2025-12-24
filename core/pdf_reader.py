@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from io import BytesIO
 from typing import List, Optional
 
 import pdfplumber
@@ -11,31 +12,30 @@ from core.models import ParsedPDF
 
 
 def read_pdf(file_bytes: bytes) -> ParsedPDF:
-    """Read PDF into text-by-page and tables-by-page.
+    """Read a BI PDF into text-by-page and tables-by-page.
 
-    Performance note:
-    - Full-table extraction on every page can be slow.
-    - For these BIs, we almost always need page 1 (summary tables) and
-      the schedule pages (Policy Year tables), which are commonly split
-      across page 2 & 3.
+    Key requirements for these BIs:
+    - Page 1 contains summary tables (premium summary, GST, UIN, etc.).
+    - The benefit schedule table (Policy Year rows) can span multiple pages.
 
-    Heuristic:
-    - Always extract tables for pages 1–3 (0,1,2).
-    - Also extract tables for any page that contains 'policy year' in its text.
-    - Also extract tables for a page immediately following a 'policy year' page
-      (continuation pages often omit the header).
+    Strategy:
+    - Always extract *text* for all pages.
+    - Extract *tables* for page 1 & 2 (index 0,1) always.
+    - Detect when the schedule starts (a page that contains 'policy year' OR
+      looks like it contains schedule rows), then extract tables for that page
+      and ALL subsequent pages.
+
+    This ensures we capture schedules even if they spill into page 4+.
     """
 
     text_by_page: List[str] = []
     tables_by_page: List[List[List[List[Optional[str]]]]] = []
 
-    from io import BytesIO
-
-    
     def _looks_like_schedule_page(page_text: str) -> bool:
-        """Heuristic: continuation schedule pages may not repeat 'Policy Year' header.
-        Detect pages that look like they contain schedule rows as plain text, e.g.:
-            '70 19 - 9,95,700 - - 1,89,00,000 ...'
+        """Heuristic: detect schedule pages even when the header is missing.
+
+        Continuation pages sometimes omit the 'Policy Year' header, but the body
+        still contains many rows that begin with numeric columns (age/policy-year).
         """
         if not page_text:
             return False
@@ -43,35 +43,29 @@ def read_pdf(file_bytes: bytes) -> ParsedPDF:
         # count lines that start with: <age> <policy_year> ...
         pat = re.compile(r"^\d{1,3}\s+\d{1,3}\s+[-–—]|^\d{1,3}\s+\d{1,3}\s+\d", re.I)
         hits = 0
-        for ln in lines[:80]:  # cap for speed
+        for ln in lines[:120]:
             if pat.search(ln):
                 hits += 1
             if hits >= 5:
                 return True
         return False
 
-with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         # First pass: extract text for all pages
         for p in pdf.pages:
             text_by_page.append(p.extract_text() or "")
 
         # Second pass: extract tables selectively
-        #
-        # We need schedule tables from 'Policy Year' pages, and those tables can
-        # continue across multiple pages without repeating the 'Policy Year' header.
-        # So once we detect a schedule page, we keep extracting tables for all
-        # subsequent pages (until the document ends).
         schedule_started = False
         for idx, p in enumerate(pdf.pages):
-            txt = (text_by_page[idx] or "").lower()
-            has_policy_year = ("policy year" in txt)
-            looks_like_schedule = _looks_like_schedule_page(text_by_page[idx] or "")
+            page_txt = text_by_page[idx] or ""
+            txt_l = page_txt.lower()
 
-            # Always extract tables for pages 1–2 (0,1) because they contain the
-            # core summary blocks (premium summary, GST rates, etc.).
-            #
-            # For the schedule, start extracting when we detect 'policy year' and
-            # continue for all later pages (continuation pages often omit the header).
+            has_policy_year = "policy year" in txt_l
+            looks_like_schedule = _looks_like_schedule_page(page_txt)
+
+            # Always include first 2 pages (summary blocks), and once schedule starts,
+            # include all subsequent pages.
             should_extract_tables = (idx in (0, 1)) or schedule_started or has_policy_year or looks_like_schedule
 
             if should_extract_tables:
@@ -86,6 +80,7 @@ with pdfplumber.open(BytesIO(file_bytes)) as pdf:
 
             if has_policy_year or looks_like_schedule:
                 schedule_started = True
+
     # Fallback: if almost no text, try pypdf extraction
     if sum(len(t.strip()) for t in text_by_page) < 50:
         reader = PdfReader(BytesIO(file_bytes))
@@ -132,7 +127,7 @@ def extract_bi_generation_date(page_text: str) -> Optional[date]:
     Supports patterns like:
       - "BI (Quote) Date : 31/03/2023"
       - "Date of Quote: 31-03-2023"
-      - top-right date with month-name: "31 Mar 2023"
+      - unlabelled month-name date: "31 Mar 2023"
     """
 
     t = (page_text or "").replace("\n", " ")
