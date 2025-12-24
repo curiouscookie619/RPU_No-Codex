@@ -222,6 +222,29 @@ def _last_non_null(schedule_rows: List[Dict[str, Any]], key: str) -> Optional[fl
 # Handler
 # -------------------------
 
+
+def _safe_anniversary(d: date, years_to_add: int) -> date:
+    """
+    Return d shifted by `years_to_add` years, keeping month/day when possible.
+    Handles Feb 29th by clamping to Feb 28th on non-leap years.
+    """
+    y = d.year + int(years_to_add)
+    m = d.month
+    day = d.day
+    try:
+        return date(y, m, day)
+    except ValueError:
+        # clamp Feb 29 -> Feb 28
+        if m == 2 and day == 29:
+            return date(y, 2, 28)
+        # generic clamp to last valid day of month
+        for dd in (31, 30, 29, 28):
+            try:
+                return date(y, m, dd)
+            except ValueError:
+                continue
+        return date(y, m, 28)
+
 class GISHandler(ProductHandler):
     product_id = "GIS"
 
