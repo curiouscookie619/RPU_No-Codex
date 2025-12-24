@@ -98,8 +98,8 @@ def save_case(
                 rpu_date,
                 mode,
                 file_hash,
-                json.dumps(extracted_json),
-                json.dumps(outputs_json),
+                json.dumps(extracted_json, default=str),
+                json.dumps(outputs_json, default=str),
             ),
         )
         conn.commit()
@@ -191,8 +191,8 @@ def main():
         extracted = handler.extract(parsed)
         outputs = handler.calculate(extracted, ptd)
 
-        extracted_dump = extracted.model_dump()
-        outputs_dump = outputs.model_dump()
+        extracted_dump = extracted.model_dump(mode="json")
+        outputs_dump = outputs.model_dump(mode="json")
 
         # Build case_id (we store only hashes, not proposer name)
         case_id = make_case_id(
