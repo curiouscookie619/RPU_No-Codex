@@ -87,14 +87,14 @@ with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             if has_policy_year or looks_like_schedule:
                 schedule_started = True
     # Fallback: if almost no text, try pypdf extraction
-    if sum(len(t.strip()) for t in text_by_page) < 50:
-        reader = PdfReader(BytesIO(file_bytes))
-        text_by_page = [(page.extract_text() or "") for page in reader.pages]
+            if sum(len(t.strip()) for t in text_by_page) < 50:
+            reader = PdfReader(BytesIO(file_bytes))
+            text_by_page = [(page.extract_text() or "") for page in reader.pages]
 
-    return ParsedPDF(
-        text_by_page=text_by_page,
-        tables_by_page=tables_by_page,
-        page_count=len(text_by_page),
+            return ParsedPDF(
+            text_by_page=text_by_page,
+            tables_by_page=tables_by_page,
+            page_count=len(text_by_page),
     )
 
 
