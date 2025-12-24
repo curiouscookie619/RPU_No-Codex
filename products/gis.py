@@ -87,12 +87,32 @@ def _find_value_in_tables(
                     continue
                 row_text = " ".join(_clean_text(c).lower() for c in row if c is not None)
                 if needle in row_text:
-                    # pick last numeric cell
                     for c in reversed(row):
                         n = _to_number(c)
                         if n is not None:
                             return n
     return None
+
+
+def _safe_anniversary(d: date, years_to_add: int) -> date:
+    """
+    Shift date by `years_to_add` years keeping month/day when possible.
+    Clamps Feb 29 -> Feb 28 on non-leap years and handles month-end safely.
+    """
+    y = d.year + int(years_to_add)
+    m = d.month
+    day = d.day
+    try:
+        return date(y, m, day)
+    except ValueError:
+        if m == 2 and day == 29:
+            return date(y, 2, 28)
+        for dd in (31, 30, 29, 28):
+            try:
+                return date(y, m, dd)
+            except ValueError:
+                continue
+        return date(y, m, 28)
 
 
 def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dict[str, Any]]:
@@ -107,7 +127,6 @@ def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dic
         * if amounts vary -> one discrete segment listing year: amount (truncated in UI; PDF will show full table)
     Returned segment dicts are meant for display only.
     """
-    # Collect payout events (only rows where income is a positive number)
     events: List[Dict[str, Any]] = []
     for r in (schedule_rows or []):
         py = r.get("policy_year")
@@ -127,7 +146,6 @@ def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dic
     if not events:
         return []
 
-    # Check if payouts are continuous across years
     continuous = all(
         events[i]["policy_year"] == events[i - 1]["policy_year"] + 1 for i in range(1, len(events))
     )
@@ -135,7 +153,6 @@ def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dic
     segments: List[Dict[str, Any]] = []
 
     if continuous:
-        # Build piecewise-constant runs (this gives "₹X for Y years" when income changes only once)
         runs: List[List[Dict[str, Any]]] = [[events[0]]]
         for e in events[1:]:
             if abs(e["income"] - runs[-1][-1]["income"]) < 0.0001:
@@ -143,7 +160,6 @@ def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dic
             else:
                 runs.append([e])
 
-        # If income changes too many times (e.g., every year), collapse to a single "from-to" segment
         if len(runs) > 4:
             segments.append(
                 {
@@ -169,14 +185,12 @@ def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dic
             )
         return segments
 
-    # Discontinuous payouts (discrete years)
     by_amount: Dict[float, List[int]] = {}
     items: List[Tuple[int, float]] = []
     for e in events:
         by_amount.setdefault(e["income"], []).append(e["calendar_year"])
         items.append((e["calendar_year"], e["income"]))
 
-    # If all amounts same -> one discrete segment
     if len(by_amount) == 1:
         amt = next(iter(by_amount.keys()))
         years = sorted(next(iter(by_amount.values())))
@@ -185,8 +199,6 @@ def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dic
         )
         return segments
 
-    # Otherwise: if the schedule appears like repeated same amount across several years and a few other unique points,
-    # show the constant-year lists first, then the remaining varying points.
     used_years: set[int] = set()
     for amt, years in sorted(by_amount.items(), key=lambda kv: (-len(kv[1]), kv[0])):
         if len(years) >= 2:
@@ -206,6 +218,7 @@ def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dic
         )
 
     return segments
+
 
 def _last_non_null(schedule_rows: List[Dict[str, Any]], key: str) -> Optional[float]:
     for r in reversed(schedule_rows or []):
@@ -234,11 +247,9 @@ class GISHandler(ProductHandler):
         return 0.0, {"match": "no"}
 
     def extract(self, parsed: ParsedPDF) -> ExtractedFields:
-        # BI date from page 1 text
         page1 = (parsed.text_by_page or [""])[0]
         bi_date = extract_bi_generation_date(page1) or date.today()
 
-        # Build kv from 2-column style rows across all tables
         kv: Dict[str, str] = {}
         for tb in _flatten_tables(parsed):
             for row in (tb or []):
@@ -261,13 +272,11 @@ class GISHandler(ProductHandler):
         age = _to_int(kv.get("age (years)") or kv.get("age") or "")
         gender = (kv.get("gender of the life assured") or kv.get("gender") or "").title() or None
 
-        # Premium Summary table on page 2: "Instalment Premium without GST"
         instalment_premium_wo_gst = _find_value_in_tables(
             parsed.tables_by_page,
             "Instalment Premium without GST",
         )
 
-        # Sum Assured on death in kv sometimes absent; keep best-effort
         sum_assured = _to_number(
             kv.get("sum assured on death (at inception of the policy) rs.")
             or kv.get("sum assured on death (at inception of the policy) rs")
@@ -319,7 +328,6 @@ class GISHandler(ProductHandler):
             if not tb or len(tb) < 2:
                 continue
 
-            # find header row containing "Policy Year" within first 6 rows
             header_row_idx = None
             for i in range(min(6, len(tb))):
                 row = tb[i] or []
@@ -332,7 +340,6 @@ class GISHandler(ProductHandler):
                 base = tb[header_row_idx] or []
                 merged = [(_clean_text(c) if c is not None else "") for c in base]
 
-                # merge next 2 rows to handle multi-row headers
                 for j in range(header_row_idx + 1, min(header_row_idx + 3, len(tb))):
                     r2 = tb[j] or []
                     for col in range(min(len(merged), len(r2))):
@@ -370,6 +377,7 @@ class GISHandler(ProductHandler):
                     if pt_years and py_val >= int(pt_years):
                         reached_end = True
                         break
+
         return rows_out
 
     def calculate(self, extracted: ExtractedFields, ptd: date) -> ComputedOutputs:
@@ -380,7 +388,7 @@ class GISHandler(ProductHandler):
           Reduced paid-up income payable = (It * R) - (Ia * (1 - R))
 
         where:
-          - Pp = premiums payable from RCD up to RPU date (in months for this product)
+          - Pp = premiums payable from RCD up to PTD (in months for this product)
           - Pt = total premiums payable during PPT (in months)
           - It = total income benefits over the full income payout term (as per BI schedule)
           - Ia = income already paid up to the RPU date (assume no payout on RCD; premium is paid first, then payout)
@@ -393,7 +401,7 @@ class GISHandler(ProductHandler):
         )
 
         # ---- Premium months (Pp, Pt) ----
-        # months between RCD and RPU date (RPU date = PTD + grace)
+        # IMPORTANT: months_paid is based on PTD (not PTD+grace), per agreed logic.
         months_paid = max(0, (ptd.year - rcd.year) * 12 + (ptd.month - rcd.month))
         months_payable_total = int(extracted.ppt_years) * 12 if extracted.ppt_years else 0
 
@@ -411,8 +419,13 @@ class GISHandler(ProductHandler):
             if inc_f <= 0:
                 continue
             py_i = int(py)
+
+            # Calendar year label: RCD.year + PolicyYear - 1
             cal_year = int(rcd.year + py_i - 1)
-            payout_date = _safe_anniversary(rcd, py_i)  # at end of PY (RCD + PY years)
+
+            # Payout date at end of nth policy year = RCD + (n-1) years
+            payout_date = _safe_anniversary(rcd, py_i - 1)
+
             income_events.append(
                 {
                     "policy_year": py_i,
@@ -429,21 +442,16 @@ class GISHandler(ProductHandler):
         Ia = sum(e["amount"] for e in income_events if e["payout_date"] < rpu_date)
 
         # ---- Reduced paid-up income payable (net after adjustment) ----
-        # RPU_income_total = (It * R) - (Ia * (1 - R))
         rpu_income_total = (It * R) - (Ia * (1.0 - R))
-
-        # Never show negative payable income
         if rpu_income_total < 0:
             rpu_income_total = 0.0
 
         # Remaining full-pay income after RPU date (for reference)
         income_due_full = sum(e["amount"] for e in income_events if e["payout_date"] >= rpu_date)
 
-        # Scale maturity and death benefits by R (as per current simplification; can be tightened per SL if needed)
         maturity = _last_non_null(extracted.schedule_rows, "maturity")
         last_death = _last_non_null(extracted.schedule_rows, "death")
 
-        # Display segments for UI/PDF
         segments = _income_segments(extracted.schedule_rows, rcd)
 
         fully_paid = {
