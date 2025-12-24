@@ -60,7 +60,7 @@ def render_one_pager(
 
     # Income table (calendar year wise)
     income_items_full = fully_paid.get("income_items") or []
-    income_items_rpu = rpu.get("income_items") or []
+    income_items_rpu = rpu.get("income_items_remaining_full") or []
     rpu_by_year = {int(i.get("calendar_year")): i.get("amount") for i in income_items_rpu if i.get("calendar_year") is not None}
 
     c.setFont("Helvetica-Bold", 10)
@@ -101,7 +101,7 @@ def render_one_pager(
     c.setFont("Helvetica", 10)
     c.drawString(40, y, f"RPU Factor: {rpu.get('rpu_factor')}")
     y -= 14
-    c.drawString(40, y, f"Reduced Income Pay-outs (sum): {_fmt_money(rpu.get('total_income'))}")
+    c.drawString(40, y, f"Net Income payable after RPU (SL): {_fmt_money(rpu.get('income_payable_after_rpu'))}")
     y -= 14
     c.drawString(40, y, f"Reduced Maturity / Lump Sum: {_fmt_money(rpu.get('maturity'))}")
     y -= 14

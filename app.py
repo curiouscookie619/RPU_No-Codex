@@ -105,6 +105,32 @@ def save_case(
         conn.commit()
 
 
+def _segments_from_income_items(items: list[dict]) -> list[dict]:
+    """Group income items (calendar_year, amount) into segments with constant amount."""
+    # items must have calendar_year:int and amount:float
+    clean = []
+    for it in items or []:
+        y = it.get("calendar_year")
+        a = it.get("amount")
+        if y is None or a is None:
+            continue
+        try:
+            clean.append((int(y), float(a)))
+        except Exception:
+            continue
+    clean.sort(key=lambda x: x[0])
+    segs: list[dict] = []
+    if not clean:
+        return segs
+    cur_start, cur_end, cur_amt = clean[0][0], clean[0][0], clean[0][1]
+    for y, a in clean[1:]:
+        if a == cur_amt and y == cur_end + 1:
+            cur_end = y
+        else:
+            segs.append({"start_year": cur_start, "end_year": cur_end, "amount": cur_amt, "years": (cur_end-cur_start+1)})
+            cur_start, cur_end, cur_amt = y, y, a
+    segs.append({"start_year": cur_start, "end_year": cur_end, "amount": cur_amt, "years": (cur_end-cur_start+1)})
+    return segs
 def _fmt_money(v: Any) -> str:
     if v is None:
         return "-"
@@ -271,10 +297,18 @@ def main():
         st.divider()
 
         st.markdown("### Reduced Paid-Up (Assuming non-payment after PTD + grace)")
-        st.write(f"- RPU factor: **{rpu.get('rpu_factor')}**")
-        _render_income_segments_bullets(rpu.get("income_segments") or [], "Income pay-outs (scaled)", scale=float(rpu.get("rpu_factor") or 0.0))
+        st.write(f"- RPU factor (R = Pp/Pt): **{rpu.get('rpu_factor')}**")
 
-        st.write(f"- Total Income (scaled): ₹{_fmt_money(rpu.get('total_income'))}")
+        # Remaining schedule (full-pay amounts)
+        remaining_items = rpu.get("income_items_remaining_full") or []
+        remaining_segments = _segments_from_income_items(remaining_items)
+        _render_income_segments_bullets(remaining_segments, "Remaining income schedule (as per BI)")
+
+        st.write(f"- Total Income over term (It): ₹{_fmt_money(rpu.get('income_total_full'))}")
+        st.write(f"- Income already paid till RPU date (Ia): ₹{_fmt_money(rpu.get('income_already_paid'))}")
+        st.write(f"- Income due after RPU date (full-pay reference): ₹{_fmt_money(rpu.get('income_due_full'))}")
+        st.write(f"- **Net Income payable after RPU (SL formula): ₹{_fmt_money(rpu.get('income_payable_after_rpu'))}**")
+
         st.write(f"- Maturity (scaled): ₹{_fmt_money(rpu.get('maturity'))}")
         st.write(f"- Death Benefit (scaled): ₹{_fmt_money(rpu.get('death_scaled'))}")
 

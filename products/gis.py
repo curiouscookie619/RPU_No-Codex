@@ -373,71 +373,107 @@ class GISHandler(ProductHandler):
         return rows_out
 
     def calculate(self, extracted: ExtractedFields, ptd: date) -> ComputedOutputs:
+        """Compute Fully Paid vs Reduced Paid-Up values for GIS.
+
+        Income RPU logic (as per SL):
+          R = Pp / Pt
+          Reduced paid-up income payable = (It * R) - (Ia * (1 - R))
+
+        where:
+          - Pp = premiums payable from RCD up to RPU date (in months for this product)
+          - Pt = total premiums payable during PPT (in months)
+          - It = total income benefits over the full income payout term (as per BI schedule)
+          - Ia = income already paid up to the RPU date (assume no payout on RCD; premium is paid first, then payout)
+        """
+
         rcd, rpu_date, grace_days = derive_rcd_and_rpu_dates(
             bi_date=extracted.bi_generation_date,
             ptd=ptd,
             mode=extracted.mode,
         )
 
-        # Income events (only years where income is present)
+        # ---- Premium months (Pp, Pt) ----
+        # months between RCD and RPU date (RPU date = PTD + grace)
+        months_paid = max(0, (rpu_date.year - rcd.year) * 12 + (rpu_date.month - rcd.month))
+        months_payable_total = int(extracted.ppt_years) * 12 if extracted.ppt_years else 0
+
+        R = (months_paid / months_payable_total) if months_payable_total > 0 else 0.0
+        R = max(0.0, min(1.0, R))
+
+        # ---- Build income event schedule from BI (calendar years) ----
         income_events: List[Dict[str, Any]] = []
         for r in (extracted.schedule_rows or []):
             py = r.get("policy_year")
             inc = r.get("income")
             if py is None:
                 continue
-            try:
-                inc_f = float(inc) if inc is not None else 0.0
-            except Exception:
-                inc_f = 0.0
+            inc_f = float(inc) if inc is not None else 0.0
             if inc_f <= 0:
                 continue
-            cal_year = int(rcd.year + int(py) - 1)
+            py_i = int(py)
+            cal_year = int(rcd.year + py_i - 1)
+            payout_date = _safe_anniversary(rcd, py_i)  # at end of PY (RCD + PY years)
             income_events.append(
-                {"policy_year": int(py), "calendar_year": cal_year, "amount": inc_f}
+                {
+                    "policy_year": py_i,
+                    "calendar_year": cal_year,
+                    "payout_date": payout_date,
+                    "amount": inc_f,
+                }
             )
         income_events.sort(key=lambda x: x["policy_year"])
 
-        total_income = sum(e["amount"] for e in income_events)
+        It = sum(e["amount"] for e in income_events)
 
+        # Income already paid up to RPU date (strictly before RPU date)
+        Ia = sum(e["amount"] for e in income_events if e["payout_date"] < rpu_date)
+
+        # ---- Reduced paid-up income payable (net after adjustment) ----
+        # RPU_income_total = (It * R) - (Ia * (1 - R))
+        rpu_income_total = (It * R) - (Ia * (1.0 - R))
+
+        # Never show negative payable income
+        if rpu_income_total < 0:
+            rpu_income_total = 0.0
+
+        # Remaining full-pay income after RPU date (for reference)
+        income_due_full = sum(e["amount"] for e in income_events if e["payout_date"] >= rpu_date)
+
+        # Scale maturity and death benefits by R (as per current simplification; can be tightened per SL if needed)
         maturity = _last_non_null(extracted.schedule_rows, "maturity")
         last_death = _last_non_null(extracted.schedule_rows, "death")
-
-        # months paid vs total (approx, month-diff)
-        months_paid = max(0, (ptd.year - rcd.year) * 12 + (ptd.month - rcd.month))
-        months_payable_total = int(extracted.ppt_years) * 12 if extracted.ppt_years else 0
-        rpu_factor = (months_paid / months_payable_total) if months_payable_total > 0 else 0.0
-        rpu_factor = max(0.0, min(1.0, rpu_factor))
 
         # Display segments for UI/PDF
         segments = _income_segments(extracted.schedule_rows, rcd)
 
         fully_paid = {
             "instalment_premium_without_gst": extracted.annualized_premium_excl_tax,
-            "total_income": float(total_income),
+            "total_income": float(It),
             "income_segments": segments,
             "income_items": income_events,
             "maturity": float(maturity) if maturity is not None else None,
             "death_last_year": float(last_death) if last_death is not None else None,
         }
 
-        rpu_income_events = [
-            {**e, "amount": round(float(e["amount"]) * rpu_factor, 2)} for e in income_events
-        ]
-
         reduced_paid_up = {
-            "rpu_factor": round(rpu_factor, 6),
-            "total_income": float(total_income) * rpu_factor,
+            "rpu_factor": round(R, 6),
+            "income_total_full": float(It),
+            "income_already_paid": float(Ia),
+            "income_due_full": float(income_due_full),
+            "income_payable_after_rpu": float(rpu_income_total),
             "income_segments": segments,
-            "income_items": rpu_income_events,
-            "maturity": (float(maturity) * rpu_factor) if maturity is not None else None,
-            "death_scaled": (float(last_death) * rpu_factor) if last_death is not None else None,
+            # For table/PDF: show remaining years (>= RPU date) with full-pay amounts,
+            # and show a single net payable figure separately (since SL formula nets out).
+            "income_items_remaining_full": [e for e in income_events if e["payout_date"] >= rpu_date],
+            "maturity": (float(maturity) * R) if maturity is not None else None,
+            "death_scaled": (float(last_death) * R) if last_death is not None else None,
         }
 
         notes = [
             "Device is logged as 'unknown' (internal prototype).",
-            "Income segments are derived from BI schedule rows and shown in calendar years (based on derived RCD).",
-            "RPU factor uses months paid / total months payable (PPT) as per Sales Literature assumptions.",
+            "Calendar year = RCD.year + PolicyYear - 1 (as per derived RCD).",
+            "Income already paid (Ia) includes payouts with payout_date < RPU date (PTD + grace).",
+            "Reduced paid-up income payable uses: (It × R) − (Ia × (1 − R)), where R = Pp/Pt.",
         ]
 
         return ComputedOutputs(
@@ -447,7 +483,7 @@ class GISHandler(ProductHandler):
             grace_period_days=grace_days,
             months_paid=months_paid,
             months_payable_total=months_payable_total,
-            rpu_factor=rpu_factor,
+            rpu_factor=R,
             fully_paid=fully_paid,
             reduced_paid_up=reduced_paid_up,
             notes=notes,
