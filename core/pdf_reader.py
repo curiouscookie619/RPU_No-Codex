@@ -31,7 +31,26 @@ def read_pdf(file_bytes: bytes) -> ParsedPDF:
 
     from io import BytesIO
 
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+    
+    def _looks_like_schedule_page(page_text: str) -> bool:
+        """Heuristic: continuation schedule pages may not repeat 'Policy Year' header.
+        Detect pages that look like they contain schedule rows as plain text, e.g.:
+            '70 19 - 9,95,700 - - 1,89,00,000 ...'
+        """
+        if not page_text:
+            return False
+        lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+        # count lines that start with: <age> <policy_year> ...
+        pat = re.compile(r"^\d{1,3}\s+\d{1,3}\s+[-–—]|^\d{1,3}\s+\d{1,3}\s+\d", re.I)
+        hits = 0
+        for ln in lines[:80]:  # cap for speed
+            if pat.search(ln):
+                hits += 1
+            if hits >= 5:
+                return True
+        return False
+
+with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         # First pass: extract text for all pages
         for p in pdf.pages:
             text_by_page.append(p.extract_text() or "")
@@ -46,13 +65,14 @@ def read_pdf(file_bytes: bytes) -> ParsedPDF:
         for idx, p in enumerate(pdf.pages):
             txt = (text_by_page[idx] or "").lower()
             has_policy_year = ("policy year" in txt)
+            looks_like_schedule = _looks_like_schedule_page(text_by_page[idx] or "")
 
             # Always extract tables for pages 1–2 (0,1) because they contain the
             # core summary blocks (premium summary, GST rates, etc.).
             #
             # For the schedule, start extracting when we detect 'policy year' and
             # continue for all later pages (continuation pages often omit the header).
-            should_extract_tables = (idx in (0, 1)) or schedule_started or has_policy_year
+            should_extract_tables = (idx in (0, 1)) or schedule_started or has_policy_year or looks_like_schedule
 
             if should_extract_tables:
                 try:
@@ -64,7 +84,7 @@ def read_pdf(file_bytes: bytes) -> ParsedPDF:
 
             tables_by_page.append(tables)
 
-            if has_policy_year:
+            if has_policy_year or looks_like_schedule:
                 schedule_started = True
     # Fallback: if almost no text, try pypdf extraction
     if sum(len(t.strip()) for t in text_by_page) < 50:
