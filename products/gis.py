@@ -127,97 +127,84 @@ def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dic
     if not events:
         return []
 
-    # Identify consecutive runs by policy year
-    runs: List[List[Dict[str, Any]]] = []
-    current = [events[0]]
-    for e in events[1:]:
-        if e["policy_year"] == current[-1]["policy_year"] + 1:
-            current.append(e)
-        else:
-            runs.append(current)
-            current = [e]
-    runs.append(current)
+    # Check if payouts are continuous across years
+    continuous = all(
+        events[i]["policy_year"] == events[i - 1]["policy_year"] + 1 for i in range(1, len(events))
+    )
 
     segments: List[Dict[str, Any]] = []
-    singletons: List[Dict[str, Any]] = []
 
-    for run in runs:
-        if len(run) == 1:
-            singletons.append(run[0])
-            continue
+    if continuous:
+        # Build piecewise-constant runs (this gives "₹X for Y years" when income changes only once)
+        runs: List[List[Dict[str, Any]]] = [[events[0]]]
+        for e in events[1:]:
+            if abs(e["income"] - runs[-1][-1]["income"]) < 0.0001:
+                runs[-1].append(e)
+            else:
+                runs.append([e])
 
-        incomes = [x["income"] for x in run]
-        start_year = run[0]["calendar_year"]
-        end_year = run[-1]["calendar_year"]
-
-        if all(abs(v - incomes[0]) < 0.0001 for v in incomes):
-            segments.append(
-                {
-                    "kind": "continuous_constant",
-                    "amount": incomes[0],
-                    "start_year": start_year,
-                    "end_year": end_year,
-                    "count": len(run),
-                }
-            )
-        else:
+        # If income changes too many times (e.g., every year), collapse to a single "from-to" segment
+        if len(runs) > 4:
             segments.append(
                 {
                     "kind": "continuous_varying",
-                    "start_amount": incomes[0],
-                    "end_amount": incomes[-1],
-                    "start_year": start_year,
-                    "end_year": end_year,
+                    "start_amount": events[0]["income"],
+                    "end_amount": events[-1]["income"],
+                    "start_year": events[0]["calendar_year"],
+                    "end_year": events[-1]["calendar_year"],
+                    "count": len(events),
+                }
+            )
+            return segments
+
+        for run in runs:
+            segments.append(
+                {
+                    "kind": "continuous_constant",
+                    "amount": run[0]["income"],
+                    "start_year": run[0]["calendar_year"],
+                    "end_year": run[-1]["calendar_year"],
                     "count": len(run),
                 }
             )
+        return segments
 
-    # Handle non-consecutive singletons
-    if singletons:
-        by_amount: Dict[float, List[int]] = {}
-        for s in singletons:
-            by_amount.setdefault(s["income"], []).append(s["calendar_year"])
+    # Discontinuous payouts (discrete years)
+    by_amount: Dict[float, List[int]] = {}
+    items: List[Tuple[int, float]] = []
+    for e in events:
+        by_amount.setdefault(e["income"], []).append(e["calendar_year"])
+        items.append((e["calendar_year"], e["income"]))
 
-        # Years lists for repeated same amount
-        for amt, years in sorted(by_amount.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-            years_sorted = sorted(years)
-            if len(years_sorted) >= 2:
-                segments.append(
-                    {
-                        "kind": "discrete_constant",
-                        "amount": amt,
-                        "years": years_sorted,
-                        "count": len(years_sorted),
-                    }
-                )
+    # If all amounts same -> one discrete segment
+    if len(by_amount) == 1:
+        amt = next(iter(by_amount.keys()))
+        years = sorted(next(iter(by_amount.values())))
+        segments.append(
+            {"kind": "discrete_constant", "amount": amt, "years": years, "count": len(years)}
+        )
+        return segments
 
-        # Remaining varying singletons (unique amounts)
-        varying = []
-        for s in singletons:
-            yrs = by_amount.get(s["income"], [])
-            if len(yrs) == 1:  # unique amount
-                varying.append((s["calendar_year"], s["income"]))
+    # Otherwise: if the schedule appears like repeated same amount across several years and a few other unique points,
+    # show the constant-year lists first, then the remaining varying points.
+    used_years: set[int] = set()
+    for amt, years in sorted(by_amount.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        if len(years) >= 2:
+            ys = sorted(years)
+            segments.append({"kind": "discrete_constant", "amount": amt, "years": ys, "count": len(ys)})
+            used_years.update(ys)
 
-        if varying:
-            varying.sort(key=lambda x: x[0])
-            segments.append(
-                {
-                    "kind": "discrete_varying",
-                    "items": [{"year": y, "amount": a} for y, a in varying],
-                    "count": len(varying),
-                }
-            )
+    varying = [(y, a) for (y, a) in items if y not in used_years]
+    varying.sort(key=lambda x: x[0])
+    if varying:
+        segments.append(
+            {
+                "kind": "discrete_varying",
+                "items": [{"year": y, "amount": a} for y, a in varying],
+                "count": len(varying),
+            }
+        )
 
-    # Sort segments in a stable, intuitive way
-    def seg_sort_key(seg: Dict[str, Any]):
-        if seg["kind"].startswith("continuous"):
-            return (0, seg.get("start_year", 9999))
-        if seg["kind"].startswith("discrete"):
-            years = seg.get("years") or ([seg["items"][0]["year"]] if seg.get("items") else [9999])
-            return (1, years[0])
-        return (2, 9999)
-
-    segments.sort(key=seg_sort_key)
     return segments
 
 def _last_non_null(schedule_rows: List[Dict[str, Any]], key: str) -> Optional[float]:
@@ -288,7 +275,7 @@ class GISHandler(ProductHandler):
             or ""
         )
 
-        schedule_rows = self._extract_schedule(parsed)
+        schedule_rows = self._extract_schedule(parsed, pt)
 
         income_duration = _to_int(
             kv.get("income duration (in years)")
@@ -318,14 +305,17 @@ class GISHandler(ProductHandler):
             schedule_rows=schedule_rows,
         )
 
-    def _extract_schedule(self, parsed: ParsedPDF) -> List[Dict[str, Any]]:
+    def _extract_schedule(self, parsed: ParsedPDF, pt_years: Optional[int]) -> List[Dict[str, Any]]:
         rows_out: List[Dict[str, Any]] = []
         headers: Optional[List[str]] = None
         header_keys: Optional[List[str]] = None
+        reached_end = False
 
         all_tables = _flatten_tables(parsed)
 
         for tb in all_tables:
+            if reached_end:
+                break
             if not tb or len(tb) < 2:
                 continue
 
@@ -374,9 +364,12 @@ class GISHandler(ProductHandler):
                     else:
                         row_obj[key] = _to_number(cell)
 
-                if row_obj.get("policy_year"):
+                py_val = row_obj.get("policy_year")
+                if py_val:
                     rows_out.append(row_obj)
-
+                    if pt_years and py_val >= int(pt_years):
+                        reached_end = True
+                        break
         return rows_out
 
     def calculate(self, extracted: ExtractedFields, ptd: date) -> ComputedOutputs:
