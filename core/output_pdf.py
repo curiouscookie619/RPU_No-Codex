@@ -51,14 +51,51 @@ def render_one_pager(
     c.drawString(40, y, "Fully Paid Benefits (as per BI)")
     y -= 16
     c.setFont("Helvetica", 10)
-    c.drawString(40, y, f"Total Income Pay-outs (sum): {_fmt_money(fully_paid.get('total_income'))}")
+    c.drawString(40, y, f"Instalment Premium (without GST): {_fmt_money(fully_paid.get('instalment_premium_without_gst'))}")
     y -= 14
     c.drawString(40, y, f"Maturity / Lump Sum (at maturity): {_fmt_money(fully_paid.get('maturity'))}")
     y -= 14
-    c.drawString(40, y, f"Death Benefit (at inception / schedule): {_fmt_money(fully_paid.get('death_inception'))}")
+    c.drawString(40, y, f"Death Benefit (as per schedule, last year): {_fmt_money(fully_paid.get('death_last_year'))}")
     y -= 18
 
-    c.setFont("Helvetica-Bold", 11)
+    # Income table (calendar year wise)
+    income_items_full = fully_paid.get("income_items") or []
+    income_items_rpu = rpu.get("income_items") or []
+    rpu_by_year = {int(i.get("calendar_year")): i.get("amount") for i in income_items_rpu if i.get("calendar_year") is not None}
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(40, y, "Income Pay-outs (Calendar Year-wise)")
+    y -= 14
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(40, y, "Year")
+    c.drawString(110, y, "Fully Paid")
+    c.drawString(220, y, "Reduced Paid-Up")
+    y -= 10
+    c.setFont("Helvetica", 9)
+    for row in income_items_full:
+        yr = row.get("calendar_year")
+        amt_full = row.get("amount")
+        amt_rpu = rpu_by_year.get(int(yr)) if yr is not None else None
+        if y < 90:
+            c.showPage()
+            y = h - 40
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(40, y, "Income Pay-outs (contd.)")
+            y -= 14
+            c.setFont("Helvetica-Bold", 9)
+            c.drawString(40, y, "Year")
+            c.drawString(110, y, "Fully Paid")
+            c.drawString(220, y, "Reduced Paid-Up")
+            y -= 10
+            c.setFont("Helvetica", 9)
+        c.drawString(40, y, str(yr) if yr is not None else "-")
+        c.drawRightString(200, y, _fmt_money(amt_full))
+        c.drawRightString(320, y, _fmt_money(amt_rpu))
+        y -= 12
+
+    c.setFont("Helvetica", 10)
+    c.drawString(40, y, f"Total Income (sum): {_fmt_money(fully_paid.get('total_income'))}")
+    y -= 18
     c.drawString(40, y, "Reduced Paid-Up Benefits (illustrative, if next premium is not paid)")
     y -= 16
     c.setFont("Helvetica", 10)

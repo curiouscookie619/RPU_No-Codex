@@ -11,6 +11,13 @@ class ParsedPDF(BaseModel):
     page_count: int
 
 
+
+
+    @property
+    def text(self) -> str:
+        """Backward-compatible full text (all pages concatenated)."""
+        return "\n".join(self.text_by_page or [])
+
 class ExtractedFields(BaseModel):
     product_name: str
     product_uin: Optional[str] = None

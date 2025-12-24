@@ -1,45 +1,46 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from datetime import date
+from typing import Any, Dict, List, Optional, Tuple
 
-from products.base import ProductHandler
+from core.models import ParsedPDF, ExtractedFields, ComputedOutputs
+from core.pdf_reader import extract_bi_generation_date
 from core.date_logic import derive_rcd_and_rpu_dates
+from products.base import ProductHandler
 
 
 # -------------------------
 # Helpers
 # -------------------------
 
-def _clean_text(s: str) -> str:
-    return " ".join((s or "").replace("\n", " ").split()).strip()
+def _clean_text(s: Any) -> str:
+    return " ".join(str(s or "").replace("\n", " ").split()).strip()
 
 
-def _norm_key(s: str) -> str:
+def _norm_key(s: Any) -> str:
     s = _clean_text(s)
     s = s.replace(" :", ":")
     if s.endswith(":"):
         s = s[:-1]
-    s = _clean_text(s)
-    return s.lower()
+    return _clean_text(s).lower()
 
 
-def _to_int(text: str) -> Optional[int]:
-    if not text:
+def _to_int(text: Any) -> Optional[int]:
+    s = _clean_text(text)
+    if not s:
         return None
-    m = re.search(r"\d+", text.replace(",", ""))
+    m = re.search(r"\d+", s.replace(",", ""))
     return int(m.group()) if m else None
 
 
-def _to_number(text: Any) -> Optional[int]:
-    if text is None:
-        return None
-    s = _clean_text(str(text))
-    if s in {"-", "—", ""}:
+def _to_number(text: Any) -> Optional[float]:
+    s = _clean_text(text)
+    if not s or s in {"-", "—"}:
         return None
     s = s.replace(",", "").replace("₹", "").strip()
     try:
-        return int(float(s))
+        return float(s)
     except Exception:
         return None
 
@@ -52,40 +53,208 @@ def _header_key(h: str) -> str:
         return "income"
     if "maturity" in h or "lump sum" in h or "lumpsum" in h:
         return "maturity"
-    if "death benefit" in h or h.strip() == "death benefit" or "death" in h:
+    if "death" in h:
         return "death"
     return ""
 
 
+def _flatten_tables(parsed: ParsedPDF) -> List[List[List[Optional[str]]]]:
+    out: List[List[List[Optional[str]]]] = []
+    for page_tables in (parsed.tables_by_page or []):
+        for tb in (page_tables or []):
+            if tb:
+                out.append(tb)
+    return out
+
+
+def _join_text(parsed: ParsedPDF) -> str:
+    return "\n".join(parsed.text_by_page or [])
+
+
+def _find_value_in_tables(
+    tables_by_page: List[List[List[List[Optional[str]]]]],
+    row_contains: str,
+) -> Optional[float]:
+    """
+    For multi-column tables (like Premium Summary), find a row that contains row_contains
+    and return the LAST numeric cell in that row.
+    """
+    needle = row_contains.lower()
+    for page_tables in (tables_by_page or []):
+        for tb in (page_tables or []):
+            for row in (tb or []):
+                if not row:
+                    continue
+                row_text = " ".join(_clean_text(c).lower() for c in row if c is not None)
+                if needle in row_text:
+                    # pick last numeric cell
+                    for c in reversed(row):
+                        n = _to_number(c)
+                        if n is not None:
+                            return n
+    return None
+
+
+def _income_segments(schedule_rows: List[Dict[str, Any]], rcd: date) -> List[Dict[str, Any]]:
+    """
+    Build human-readable income segments using calendar years (not policy years).
+
+    Rules (Option 1):
+    - Consecutive payout years with the same income are grouped as a continuous range.
+    - Consecutive payout years with varying income are grouped as a continuous range (with start/end amounts).
+    - Non-consecutive payouts:
+        * if all amounts are the same -> one discrete segment with a year list
+        * if amounts vary -> one discrete segment listing year: amount (truncated in UI; PDF will show full table)
+    Returned segment dicts are meant for display only.
+    """
+    # Collect payout events (only rows where income is a positive number)
+    events: List[Dict[str, Any]] = []
+    for r in (schedule_rows or []):
+        py = r.get("policy_year")
+        inc = r.get("income")
+        if py is None:
+            continue
+        try:
+            inc_f = float(inc) if inc is not None else 0.0
+        except Exception:
+            inc_f = 0.0
+        if inc_f <= 0:
+            continue
+        cal_year = int(rcd.year + int(py) - 1)
+        events.append({"policy_year": int(py), "calendar_year": cal_year, "income": inc_f})
+
+    events.sort(key=lambda x: x["policy_year"])
+    if not events:
+        return []
+
+    # Identify consecutive runs by policy year
+    runs: List[List[Dict[str, Any]]] = []
+    current = [events[0]]
+    for e in events[1:]:
+        if e["policy_year"] == current[-1]["policy_year"] + 1:
+            current.append(e)
+        else:
+            runs.append(current)
+            current = [e]
+    runs.append(current)
+
+    segments: List[Dict[str, Any]] = []
+    singletons: List[Dict[str, Any]] = []
+
+    for run in runs:
+        if len(run) == 1:
+            singletons.append(run[0])
+            continue
+
+        incomes = [x["income"] for x in run]
+        start_year = run[0]["calendar_year"]
+        end_year = run[-1]["calendar_year"]
+
+        if all(abs(v - incomes[0]) < 0.0001 for v in incomes):
+            segments.append(
+                {
+                    "kind": "continuous_constant",
+                    "amount": incomes[0],
+                    "start_year": start_year,
+                    "end_year": end_year,
+                    "count": len(run),
+                }
+            )
+        else:
+            segments.append(
+                {
+                    "kind": "continuous_varying",
+                    "start_amount": incomes[0],
+                    "end_amount": incomes[-1],
+                    "start_year": start_year,
+                    "end_year": end_year,
+                    "count": len(run),
+                }
+            )
+
+    # Handle non-consecutive singletons
+    if singletons:
+        by_amount: Dict[float, List[int]] = {}
+        for s in singletons:
+            by_amount.setdefault(s["income"], []).append(s["calendar_year"])
+
+        # Years lists for repeated same amount
+        for amt, years in sorted(by_amount.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            years_sorted = sorted(years)
+            if len(years_sorted) >= 2:
+                segments.append(
+                    {
+                        "kind": "discrete_constant",
+                        "amount": amt,
+                        "years": years_sorted,
+                        "count": len(years_sorted),
+                    }
+                )
+
+        # Remaining varying singletons (unique amounts)
+        varying = []
+        for s in singletons:
+            yrs = by_amount.get(s["income"], [])
+            if len(yrs) == 1:  # unique amount
+                varying.append((s["calendar_year"], s["income"]))
+
+        if varying:
+            varying.sort(key=lambda x: x[0])
+            segments.append(
+                {
+                    "kind": "discrete_varying",
+                    "items": [{"year": y, "amount": a} for y, a in varying],
+                    "count": len(varying),
+                }
+            )
+
+    # Sort segments in a stable, intuitive way
+    def seg_sort_key(seg: Dict[str, Any]):
+        if seg["kind"].startswith("continuous"):
+            return (0, seg.get("start_year", 9999))
+        if seg["kind"].startswith("discrete"):
+            years = seg.get("years") or ([seg["items"][0]["year"]] if seg.get("items") else [9999])
+            return (1, years[0])
+        return (2, 9999)
+
+    segments.sort(key=seg_sort_key)
+    return segments
+
+def _last_non_null(schedule_rows: List[Dict[str, Any]], key: str) -> Optional[float]:
+    for r in reversed(schedule_rows or []):
+        v = r.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                return None
+    return None
+
+
+# -------------------------
+# Handler
+# -------------------------
+
 class GISHandler(ProductHandler):
     product_id = "GIS"
-    product_display_name = "Guaranteed Income STAR"
 
-    # --- REQUIRED by ProductHandler (abstract) ---
-    def detect(self, parsed_pdf) -> float:
-        """
-        Return confidence score 0..1 that this PDF is this product.
-        """
-        t = (parsed_pdf.text or "").lower()
+    def detect(self, parsed: ParsedPDF) -> Tuple[float, Dict[str, Any]]:
+        t = _join_text(parsed).lower()
         if "guaranteed income star" in t:
-            return 0.95
-        if "edelweiss" in t and "guaranteed income" in t and "star" in t:
-            return 0.75
-        return 0.0
+            return 0.95, {"match": "contains 'guaranteed income star'"}
+        if "guaranteed income" in t and "star" in t:
+            return 0.70, {"match": "contains 'guaranteed income' and 'star'"}
+        return 0.0, {"match": "no"}
 
-    def extract(self, parsed_pdf):
-        """
-        Return extracted schema object (whatever your base expects).
-        This relies on your existing ParsedPDF providing:
-          - text
-          - tables (list of tables; each is list of rows; each row list of cells)
-          - bi_generation_date (already parsed elsewhere)
-        """
+    def extract(self, parsed: ParsedPDF) -> ExtractedFields:
+        # BI date from page 1 text
+        page1 = (parsed.text_by_page or [""])[0]
+        bi_date = extract_bi_generation_date(page1) or date.today()
+
+        # Build kv from 2-column style rows across all tables
         kv: Dict[str, str] = {}
-
-        # Page-1 key-value tables are present within parsed_pdf.tables as 2-column rows.
-        for tb in (parsed_pdf.tables or []):
-            for row in tb:
+        for tb in _flatten_tables(parsed):
+            for row in (tb or []):
                 if not row or len(row) < 2:
                     continue
                 k = _norm_key(row[0])
@@ -93,17 +262,25 @@ class GISHandler(ProductHandler):
                 if k:
                     kv[k] = v
 
-        product_name = kv.get("name of the product") or self.product_display_name
+        product_name = kv.get("name of the product") or "Edelweiss Tokio Life- Guaranteed Income STAR"
         uin = kv.get("unique identification no.") or kv.get("uin")
-
         proposer = kv.get("name of the prospect/policyholder")
+
         mode = (kv.get("mode of payment of premium") or "Annual").title()
 
-        pt = _to_int(kv.get("policy term (in years)") or kv.get("policy term") or "") or 0
-        ppt = _to_int(
-            kv.get("premium payment term (in years)") or kv.get("premium payment term") or ""
-        ) or 0
+        pt = _to_int(kv.get("policy term (in years)") or kv.get("policy term")) or 0
+        ppt = _to_int(kv.get("premium payment term (in years)") or kv.get("premium payment term")) or 0
 
+        age = _to_int(kv.get("age (years)") or kv.get("age") or "")
+        gender = (kv.get("gender of the life assured") or kv.get("gender") or "").title() or None
+
+        # Premium Summary table on page 2: "Instalment Premium without GST"
+        instalment_premium_wo_gst = _find_value_in_tables(
+            parsed.tables_by_page,
+            "Instalment Premium without GST",
+        )
+
+        # Sum Assured on death in kv sometimes absent; keep best-effort
         sum_assured = _to_number(
             kv.get("sum assured on death (at inception of the policy) rs.")
             or kv.get("sum assured on death (at inception of the policy) rs")
@@ -111,54 +288,65 @@ class GISHandler(ProductHandler):
             or ""
         )
 
-        schedule_rows = self._extract_schedule(parsed_pdf)
+        schedule_rows = self._extract_schedule(parsed)
 
-        # Create the schema object using the base helper (your repo uses .schema())
-        return self.schema(
+        income_duration = _to_int(
+            kv.get("income duration (in years)")
+            or kv.get("'income duration' (in years)")
+            or ""
+        )
+
+        payout_freq = (kv.get("income benefit pay-out frequency") or "Annual").title() or None
+        payout_type = (kv.get("income benefit pay-out type") or "").title() or None
+
+        return ExtractedFields(
             product_name=product_name,
             product_uin=uin,
-            bi_generation_date=parsed_pdf.bi_generation_date,
+            bi_generation_date=bi_date,
             proposer_name_transient=proposer,
-            life_assured_age=_to_int(kv.get("age (years)") or ""),
-            life_assured_gender=(kv.get("gender of the life assured") or "").title() or None,
+            life_assured_age=age,
+            life_assured_gender=gender,
             mode=mode,
             policy_term_years=pt,
             ppt_years=ppt,
-            annualized_premium_excl_tax=_to_number(kv.get("instalment premium (excluding taxes) (in rupees)") or ""),
+            annualized_premium_excl_tax=instalment_premium_wo_gst,
             income_start_point_text=kv.get("income start point"),
-            income_duration_years=_to_int(kv.get("'income duration' (in years)") or kv.get("income duration (in years)") or ""),
-            income_payout_frequency=(kv.get("income benefit pay-out frequency") or "Yearly").title(),
-            income_payout_type=(kv.get("income benefit pay-out type") or "").title() or None,
+            income_duration_years=income_duration,
+            income_payout_frequency=payout_freq,
+            income_payout_type=payout_type,
             sum_assured_on_death=sum_assured,
             schedule_rows=schedule_rows,
         )
 
-    def _extract_schedule(self, parsed_pdf) -> List[Dict[str, Any]]:
+    def _extract_schedule(self, parsed: ParsedPDF) -> List[Dict[str, Any]]:
         rows_out: List[Dict[str, Any]] = []
         headers: Optional[List[str]] = None
         header_keys: Optional[List[str]] = None
 
-        for tb in (parsed_pdf.tables or []):
+        all_tables = _flatten_tables(parsed)
+
+        for tb in all_tables:
             if not tb or len(tb) < 2:
                 continue
 
-            # Find row containing "Policy Year" within first few rows
+            # find header row containing "Policy Year" within first 6 rows
             header_row_idx = None
             for i in range(min(6, len(tb))):
-                txt = " ".join((c or "") for c in (tb[i] or [])).lower()
+                row = tb[i] or []
+                txt = " ".join((_clean_text(c) for c in row)).lower()
                 if "policy" in txt and "year" in txt:
                     header_row_idx = i
                     break
 
             if header_row_idx is not None:
                 base = tb[header_row_idx] or []
-                merged = [(c or "").strip() for c in base]
+                merged = [(_clean_text(c) if c is not None else "") for c in base]
 
-                # Merge next 2 rows to handle multi-row headers
+                # merge next 2 rows to handle multi-row headers
                 for j in range(header_row_idx + 1, min(header_row_idx + 3, len(tb))):
                     r2 = tb[j] or []
                     for col in range(min(len(merged), len(r2))):
-                        nxt = (r2[col] or "").strip()
+                        nxt = _clean_text(r2[col])
                         if nxt:
                             merged[col] = f"{merged[col]} {nxt}".strip()
 
@@ -166,16 +354,14 @@ class GISHandler(ProductHandler):
                 header_keys = [_header_key(h) for h in headers]
                 data_rows = tb[min(len(tb), header_row_idx + 3):]
             else:
-                # continuation table pages
                 if headers is None or header_keys is None:
                     continue
                 data_rows = tb
 
-            for r in data_rows:
+            for r in (data_rows or []):
                 if not r:
                     continue
 
-                # Row must have policy_year numeric somewhere; else skip
                 row_obj: Dict[str, Any] = {}
                 for idx, cell in enumerate(r):
                     if idx >= len(header_keys):
@@ -184,7 +370,7 @@ class GISHandler(ProductHandler):
                     if not key:
                         continue
                     if key == "policy_year":
-                        row_obj[key] = _to_int(str(cell))
+                        row_obj[key] = _to_int(cell)
                     else:
                         row_obj[key] = _to_number(cell)
 
@@ -193,46 +379,83 @@ class GISHandler(ProductHandler):
 
         return rows_out
 
-    def calculate(self, extracted, ptd):
+    def calculate(self, extracted: ExtractedFields, ptd: date) -> ComputedOutputs:
         rcd, rpu_date, grace_days = derive_rcd_and_rpu_dates(
             bi_date=extracted.bi_generation_date,
             ptd=ptd,
             mode=extracted.mode,
         )
 
-        # Fully paid income (sum of income column)
-        total_income = sum((r.get("income") or 0) for r in extracted.schedule_rows)
+        # Income events (only years where income is present)
+        income_events: List[Dict[str, Any]] = []
+        for r in (extracted.schedule_rows or []):
+            py = r.get("policy_year")
+            inc = r.get("income")
+            if py is None:
+                continue
+            try:
+                inc_f = float(inc) if inc is not None else 0.0
+            except Exception:
+                inc_f = 0.0
+            if inc_f <= 0:
+                continue
+            cal_year = int(rcd.year + int(py) - 1)
+            income_events.append(
+                {"policy_year": int(py), "calendar_year": cal_year, "amount": inc_f}
+            )
+        income_events.sort(key=lambda x: x["policy_year"])
 
-        maturity = extracted.schedule_rows[-1].get("maturity") if extracted.schedule_rows else None
+        total_income = sum(e["amount"] for e in income_events)
+
+        maturity = _last_non_null(extracted.schedule_rows, "maturity")
+        last_death = _last_non_null(extracted.schedule_rows, "death")
+
+        # months paid vs total (approx, month-diff)
+        months_paid = max(0, (ptd.year - rcd.year) * 12 + (ptd.month - rcd.month))
+        months_payable_total = int(extracted.ppt_years) * 12 if extracted.ppt_years else 0
+        rpu_factor = (months_paid / months_payable_total) if months_payable_total > 0 else 0.0
+        rpu_factor = max(0.0, min(1.0, rpu_factor))
+
+        # Display segments for UI/PDF
+        segments = _income_segments(extracted.schedule_rows, rcd)
 
         fully_paid = {
-            "total_income_annual": int(total_income),
-            "maturity": int(maturity) if maturity else None,
-            "death_inception": extracted.sum_assured_on_death,
+            "instalment_premium_without_gst": extracted.annualized_premium_excl_tax,
+            "total_income": float(total_income),
+            "income_segments": segments,
+            "income_items": income_events,
+            "maturity": float(maturity) if maturity is not None else None,
+            "death_last_year": float(last_death) if last_death is not None else None,
         }
 
-        # RPU factor based on months paid / total months in PPT
-        months_paid = max(0, (ptd.year - rcd.year) * 12 + (ptd.month - rcd.month))
-        total_months = int(extracted.ppt_years) * 12 if extracted.ppt_years else 0
-        rpu_factor = round(months_paid / total_months, 4) if total_months else 0.0
+        rpu_income_events = [
+            {**e, "amount": round(float(e["amount"]) * rpu_factor, 2)} for e in income_events
+        ]
 
-        reduced_paid = {
-            "rpu_factor": rpu_factor,
-            "total_income": int(total_income * rpu_factor),
-            "maturity": int((maturity or 0) * rpu_factor) if maturity else None,
-            "death_scaled": int((extracted.sum_assured_on_death or 0) * rpu_factor)
-            if extracted.sum_assured_on_death
-            else None,
+        reduced_paid_up = {
+            "rpu_factor": round(rpu_factor, 6),
+            "total_income": float(total_income) * rpu_factor,
+            "income_segments": segments,
+            "income_items": rpu_income_events,
+            "maturity": (float(maturity) * rpu_factor) if maturity is not None else None,
+            "death_scaled": (float(last_death) * rpu_factor) if last_death is not None else None,
         }
 
-        return self.output_schema(
+        notes = [
+            "Device is logged as 'unknown' (internal prototype).",
+            "Income segments are derived from BI schedule rows and shown in calendar years (based on derived RCD).",
+            "RPU factor uses months paid / total months payable (PPT) as per Sales Literature assumptions.",
+        ]
+
+        return ComputedOutputs(
             rcd=rcd,
             ptd=ptd,
             rpu_date=rpu_date,
             grace_period_days=grace_days,
+            months_paid=months_paid,
+            months_payable_total=months_payable_total,
+            rpu_factor=rpu_factor,
             fully_paid=fully_paid,
-            reduced_paid_up=reduced_paid,
-            notes=[
-                "Illustrative values assuming non-payment of the next premium and policy becoming paid-up after grace period."
-            ],
+            reduced_paid_up=reduced_paid_up,
+            notes=notes,
         )
